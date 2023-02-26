@@ -5,6 +5,7 @@ use mimalloc_rust::GlobalMiMalloc;
 use rspack_core::Compiler;
 use rspack_fs::AsyncNativeFileSystem;
 use rspack_testing::apply_from_fixture;
+use rspack_tracing::enable_tracing_by_env_with_chrome_layer;
 #[cfg(feature = "tracing")]
 use rspack_tracing::enable_tracing_by_env_with_chrome_layer;
 use termcolorful::println_string_with_fg_color;
@@ -32,7 +33,7 @@ async fn main() {
 }
 
 async fn run(relative_path: &str) {
-  #[cfg(feature = "tracing")]
+  // #[cfg(feature = "tracing")]
   let guard = enable_tracing_by_env_with_chrome_layer();
   let manifest_dir = PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
   // let bundle_dir = manifest_dir.join("tests/fixtures/postcss/pxtorem");
@@ -84,7 +85,7 @@ async fn run(relative_path: &str) {
     println!("{:?}", start.elapsed());
   }
 
-  #[cfg(feature = "tracing")]
+  // #[cfg(feature = "tracing")]
   {
     if let Some(guard) = guard {
       guard.flush();

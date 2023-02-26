@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
+use crossbeam_queue::SegQueue;
 use rspack_error::{Diagnostic, Result};
 
 use crate::{
@@ -23,6 +24,7 @@ pub trait WorkerTask {
   async fn run(self) -> Result<TaskResult>;
 }
 
+#[derive(Debug)]
 pub struct FactorizeTask {
   pub original_module_identifier: Option<ModuleIdentifier>,
   pub issuer: Option<String>,
@@ -131,7 +133,7 @@ impl WorkerTask for FactorizeTask {
   }
 }
 
-pub type FactorizeQueue = WorkerQueue<FactorizeTask>;
+pub type FactorizeQueue = SegQueue<FactorizeTask>;
 
 pub struct AddTask {
   pub original_module_identifier: Option<ModuleIdentifier>,
@@ -279,7 +281,7 @@ impl WorkerTask for BuildTask {
   }
 }
 
-pub type BuildQueue = WorkerQueue<BuildTask>;
+pub type BuildQueue = SegQueue<BuildTask>;
 
 pub struct ProcessDependenciesTask {
   pub original_module_identifier: ModuleIdentifier,

@@ -3,12 +3,14 @@ use std::{
   hash::{BuildHasherDefault, Hash, Hasher},
   path::PathBuf,
   sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     // time::Instant,
     Arc,
   },
+  thread,
 };
 
+use crossbeam::epoch::Atomic;
 use dashmap::DashSet;
 use indexmap::IndexSet;
 use rayon::prelude::{
@@ -23,7 +25,7 @@ use rspack_identifier::{IdentifierMap, IdentifierSet};
 use rspack_sources::{BoxSource, CachedSource, SourceExt};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 use swc_core::ecma::ast::ModuleItem;
-use tokio::sync::mpsc::error::TryRecvError;
+use tokio::{runtime::Handle, sync::mpsc::error::TryRecvError};
 use tracing::instrument;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -424,12 +426,12 @@ impl Compilation {
       }
     }
 
-    let mut active_task_count = 0usize;
+    let active_task_count = Arc::new(AtomicUsize::new(0));
     let is_expected_shutdown = Arc::new(AtomicBool::new(false));
     let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<Result<TaskResult>>();
-    let mut factorize_queue = FactorizeQueue::new();
+    let mut factorize_queue = Arc::new(FactorizeQueue::new());
     let mut add_queue = AddQueue::new();
-    let mut build_queue = BuildQueue::new();
+    let mut build_queue = Arc::new(BuildQueue::new());
     let mut process_dependencies_queue = ProcessDependenciesQueue::new();
     let mut make_failed_dependencies: HashSet<DependencyId> = HashSet::default();
     let mut errored = None;
@@ -473,247 +475,290 @@ impl Compilation {
       );
     });
 
-    tokio::task::block_in_place(|| loop {
-      while let Some(task) = factorize_queue.get_task() {
-        tokio::spawn({
-          let result_tx = result_tx.clone();
-          let is_expected_shutdown = is_expected_shutdown.clone();
-          active_task_count += 1;
+    tokio::task::block_in_place(|| {
+      let ies = is_expected_shutdown.clone();
+      let rt = result_tx.clone();
+      let queue = factorize_queue.clone();
+      let bq = build_queue.clone();
+      // let aq = add_queue.clone();
+      let active_task_count1 = active_task_count.clone();
+      let is_parking = Arc::new(AtomicBool::new(false));
+      let worker_thread_parking = is_parking.clone();
+      let handle = Handle::current();
+      let work_thread = std::thread::spawn(move || {
+        loop {
+          // if ies.load(Ordering::SeqCst) {
+          //   break;
+          // }
+          let mut has_work = false;
+          if let Some(task) = queue.pop() {
+            has_work = true;
+            handle.spawn({
+              active_task_count1.fetch_add(1, Ordering::SeqCst);
+              let result_tx = rt.clone();
+              let is_expecting_shutdown = ies.clone();
 
-          async move {
-            if is_expected_shutdown.load(Ordering::SeqCst) {
-              return;
-            }
+              async move {
+                if is_expecting_shutdown.load(Ordering::SeqCst) {
+                  return;
+                }
 
-            let result = CatchUnwindFuture::create(task.run()).await;
+                let result = CatchUnwindFuture::create(task.run()).await;
 
-            match result {
-              Ok(result) => {
-                if !is_expected_shutdown.load(Ordering::SeqCst) {
-                  result_tx
-                    .send(result)
-                    .expect("Failed to send factorize result");
+                match result {
+                  Ok(result) => {
+                    if !is_expecting_shutdown.load(Ordering::SeqCst) {
+                      result_tx
+                        .send(result)
+                        .expect("Failed to send factorize result");
+                    }
+                  }
+                  Err(e) => {
+                    // panic on the tokio worker thread
+                    result_tx.send(Err(e)).expect("Failed to send panic info");
+                  }
                 }
               }
-              Err(e) => {
-                // panic on the tokio worker thread
-                result_tx.send(Err(e)).expect("Failed to send panic info");
-              }
-            }
+            });
+          } else {
+            // println!("parking");
           }
-        });
-      }
 
-      while let Some(task) = build_queue.get_task() {
-        tokio::spawn({
-          let result_tx = result_tx.clone();
-          let is_expected_shutdown = is_expected_shutdown.clone();
-          active_task_count += 1;
+          if let Some(task) = bq.pop() {
+            has_work = true;
+            handle.spawn({
+              active_task_count1.fetch_add(1, Ordering::SeqCst);
+              let result_tx = rt.clone();
+              // let is_expected_shutdown = is_expected_shutdown.clone();
+              let is_expecting_shutdown = ies.clone();
 
-          async move {
-            if is_expected_shutdown.load(Ordering::SeqCst) {
-              return;
-            }
+              async move {
+                // dbg!(task.module.identifier());
+                if is_expecting_shutdown.load(Ordering::SeqCst) {
+                  return;
+                }
 
-            let result = CatchUnwindFuture::create(task.run()).await;
+                let result = CatchUnwindFuture::create(task.run()).await;
 
-            match result {
-              Ok(result) => {
-                if !is_expected_shutdown.load(Ordering::SeqCst) {
-                  result_tx.send(result).expect("Failed to send build result");
+                match result {
+                  Ok(result) => {
+                    if !is_expecting_shutdown.load(Ordering::SeqCst) {
+                      result_tx.send(result).expect("Failed to send build result");
+                    }
+                  }
+                  Err(e) => {
+                    // panic on the tokio worker thread
+                    result_tx.send(Err(e)).expect("Failed to send panic info");
+                  }
                 }
               }
-              Err(e) => {
-                // panic on the tokio worker thread
-                result_tx.send(Err(e)).expect("Failed to send panic info");
-              }
-            }
+            });
           }
-        });
-      }
+          if !has_work {
+            worker_thread_parking.store(true, Ordering::SeqCst);
+            thread::park();
+          }
+        }
+      });
+      loop {
+        while let Some(task) = add_queue.get_task() {
+          active_task_count.fetch_add(1, Ordering::SeqCst);
+          let result = task.run(self);
+          result_tx.send(result).expect("Failed to send add result");
+        }
+        while let Some(task) = process_dependencies_queue.get_task() {
+          // has_work = true;
+          active_task_count.fetch_add(1, Ordering::SeqCst);
 
-      while let Some(task) = add_queue.get_task() {
-        active_task_count += 1;
-        let result = task.run(self);
-        result_tx.send(result).expect("Failed to send add result");
-      }
-
-      while let Some(task) = process_dependencies_queue.get_task() {
-        active_task_count += 1;
-
-        task.dependencies.into_iter().for_each(|id| {
-          let original_module_identifier = &task.original_module_identifier;
-          let module = self
-            .module_graph
-            .module_by_identifier(original_module_identifier)
-            .expect("Module expected");
-          let dependency = self
-            .module_graph
-            .dependency_by_id(&id)
-            .expect("dependency expected");
-
-          self.handle_module_creation(
-            &mut factorize_queue,
-            Some(task.original_module_identifier),
-            {
+          task.dependencies.par_iter().for_each(|id| {
+            let original_module_identifier = &task.original_module_identifier;
+            let module = self
+              .module_graph
+              .module_by_identifier(original_module_identifier)
+              .expect("Module expected");
+            let dependency = self
+              .module_graph
+              .dependency_by_id(&id)
+              .expect("dependency expected");
+            self.handle_module_creation(
+              &factorize_queue,
+              Some(task.original_module_identifier),
+              {
+                module
+                  .as_normal_module()
+                  .map(|module| module.resource_resolved_data().resource_path.clone())
+              },
+              vec![dependency.clone()],
+              false,
+              None,
+              None,
+              task.resolve_options.clone(),
+              self.lazy_visit_modules.clone(),
               module
                 .as_normal_module()
-                .map(|module| module.resource_resolved_data().resource_path.clone())
-            },
-            vec![dependency.clone()],
-            false,
-            None,
-            None,
-            task.resolve_options.clone(),
-            self.lazy_visit_modules.clone(),
-            module
-              .as_normal_module()
-              .and_then(|module| module.name_for_condition())
-              .map(|issuer| issuer.to_string()),
-          );
-        });
+                .and_then(|module| module.name_for_condition())
+                .map(|issuer| issuer.to_string()),
+            );
+          });
 
-        result_tx
-          .send(Ok(TaskResult::ProcessDependencies(
-            ProcessDependenciesResult {
-              module_identifier: task.original_module_identifier,
-            },
-          )))
-          .expect("Failed to send process dependencies result");
-      }
-
-      match result_rx.try_recv() {
-        Ok(item) => {
-          match item {
-            Ok(TaskResult::Factorize(task_result)) => {
-              let FactorizeTaskResult {
-                is_entry,
-                original_module_identifier,
-                factory_result,
-                module_graph_module,
-                diagnostics,
-                dependencies,
-              } = task_result;
-
-              tracing::trace!("Module created: {}", factory_result.module.identifier());
-              if !diagnostics.is_empty() {
-                make_failed_dependencies.insert(dependencies[0]);
-              }
-
-              self.push_batch_diagnostic(diagnostics);
-
-              self
-                .file_dependencies
-                .extend(factory_result.file_dependencies);
-              self
-                .context_dependencies
-                .extend(factory_result.context_dependencies);
-              self
-                .missing_dependencies
-                .extend(factory_result.missing_dependencies);
-
-              add_queue.add_task(AddTask {
-                original_module_identifier,
-                module: factory_result.module,
-                module_graph_module,
-                dependencies,
-                is_entry,
-              });
-            }
-            Ok(TaskResult::Add(task_result)) => match task_result {
-              AddTaskResult::ModuleAdded {
-                module,
-                dependencies,
-              } => {
-                tracing::trace!("Module added: {}", module.identifier());
-                build_queue.add_task(BuildTask {
-                  module,
+          work_thread.thread().unpark();
+          is_parking.store(false, Ordering::SeqCst);
+          result_tx
+            .send(Ok(TaskResult::ProcessDependencies(
+              ProcessDependenciesResult {
+                module_identifier: task.original_module_identifier,
+              },
+            )))
+            .expect("Failed to send process dependencies result");
+        }
+        match result_rx.try_recv() {
+          Ok(item) => {
+            match item {
+              Ok(TaskResult::Factorize(task_result)) => {
+                let FactorizeTaskResult {
+                  is_entry,
+                  original_module_identifier,
+                  factory_result,
+                  module_graph_module,
+                  diagnostics,
                   dependencies,
-                  loader_runner_runner: self.loader_runner_runner.clone(),
-                  compiler_options: self.options.clone(),
-                  plugin_driver: self.plugin_driver.clone(),
-                  cache: self.cache.clone(),
+                } = task_result;
+
+                tracing::trace!("Module created: {}", factory_result.module.identifier());
+                if !diagnostics.is_empty() {
+                  make_failed_dependencies.insert(dependencies[0]);
+                }
+
+                self.push_batch_diagnostic(diagnostics);
+
+                self
+                  .file_dependencies
+                  .extend(factory_result.file_dependencies);
+                self
+                  .context_dependencies
+                  .extend(factory_result.context_dependencies);
+                self
+                  .missing_dependencies
+                  .extend(factory_result.missing_dependencies);
+
+                add_queue.add_task(AddTask {
+                  original_module_identifier,
+                  module: factory_result.module,
+                  module_graph_module,
+                  dependencies,
+                  is_entry,
                 });
               }
-              AddTaskResult::ModuleReused { module, .. } => {
-                tracing::trace!("Module reused: {}, skipping build", module.identifier());
-              }
-            },
-            Ok(TaskResult::Build(task_result)) => {
-              let BuildTaskResult {
-                module,
-                dependencies,
-                build_result,
-                diagnostics,
-              } = task_result;
+              Ok(TaskResult::Add(task_result)) => match task_result {
+                AddTaskResult::ModuleAdded {
+                  module,
+                  dependencies,
+                } => {
+                  tracing::trace!("Module added: {}", module.identifier());
+                  work_thread.thread().unpark();
+                  is_parking.store(false, Ordering::SeqCst);
+                  build_queue.push(BuildTask {
+                    module,
+                    dependencies,
+                    loader_runner_runner: self.loader_runner_runner.clone(),
+                    compiler_options: self.options.clone(),
+                    plugin_driver: self.plugin_driver.clone(),
+                    cache: self.cache.clone(),
+                  });
+                }
+                AddTaskResult::ModuleReused { module, .. } => {
+                  tracing::trace!("Module reused: {}, skipping build", module.identifier());
+                }
+              },
+              Ok(TaskResult::Build(task_result)) => {
+                let BuildTaskResult {
+                  module,
+                  dependencies,
+                  build_result,
+                  diagnostics,
+                } = task_result;
 
-              if !diagnostics.is_empty() {
-                make_failed_dependencies.insert(dependencies[0]);
-              }
+                if !diagnostics.is_empty() {
+                  make_failed_dependencies.insert(dependencies[0]);
+                }
 
-              tracing::trace!("Module built: {}", module.identifier());
-              self.push_batch_diagnostic(diagnostics);
+                tracing::trace!("Module built: {}", module.identifier());
+                self.push_batch_diagnostic(diagnostics);
 
-              self
-                .file_dependencies
-                .extend(build_result.file_dependencies);
-              self
-                .context_dependencies
-                .extend(build_result.context_dependencies);
-              self
-                .missing_dependencies
-                .extend(build_result.missing_dependencies);
-              self
-                .build_dependencies
-                .extend(build_result.build_dependencies);
+                self
+                  .file_dependencies
+                  .extend(build_result.file_dependencies);
+                self
+                  .context_dependencies
+                  .extend(build_result.context_dependencies);
+                self
+                  .missing_dependencies
+                  .extend(build_result.missing_dependencies);
+                self
+                  .build_dependencies
+                  .extend(build_result.build_dependencies);
 
-              let mut dep_ids = vec![];
-              for dependency in build_result.dependencies {
-                let dep_id = self.module_graph.add_dependency(dependency);
-                dep_ids.push(dep_id);
-              }
+                let mut dep_ids = vec![];
+                for dependency in build_result.dependencies {
+                  let dep_id = self.module_graph.add_dependency(dependency);
+                  dep_ids.push(dep_id);
+                }
 
-              {
-                let mgm = self
+                {
+                  let mgm = self
+                    .module_graph
+                    .module_graph_module_by_identifier_mut(&module.identifier())
+                    .expect("Failed to get mgm");
+                  mgm.dependencies = dep_ids.clone();
+                }
+                process_dependencies_queue.add_task(ProcessDependenciesTask {
+                  dependencies: dep_ids.clone(),
+                  original_module_identifier: module.identifier(),
+                  resolve_options: module.get_resolve_options().map(ToOwned::to_owned),
+                });
+                self
                   .module_graph
-                  .module_graph_module_by_identifier_mut(&module.identifier())
-                  .expect("Failed to get mgm");
-                mgm.dependencies = dep_ids.clone();
+                  .set_module_hash(&module.identifier(), build_result.hash);
+                self.module_graph.add_module(module);
               }
-              process_dependencies_queue.add_task(ProcessDependenciesTask {
-                dependencies: dep_ids.clone(),
-                original_module_identifier: module.identifier(),
-                resolve_options: module.get_resolve_options().map(ToOwned::to_owned),
-              });
-              self
-                .module_graph
-                .set_module_hash(&module.identifier(), build_result.hash);
-              self.module_graph.add_module(module);
+              Ok(TaskResult::ProcessDependencies(task_result)) => {
+                tracing::trace!(
+                  "Processing dependencies of {} finished",
+                  task_result.module_identifier
+                );
+              }
+              Err(err) => {
+                // Severe internal error encountered, we should end the compiling here.
+                errored = Some(err);
+                dbg!(&errored);
+                is_expected_shutdown.store(true, Ordering::SeqCst);
+                work_thread.thread().unpark();
+                is_parking.store(false, Ordering::SeqCst);
+                break;
+              }
             }
-            Ok(TaskResult::ProcessDependencies(task_result)) => {
-              tracing::trace!(
-                "Processing dependencies of {} finished",
-                task_result.module_identifier
-              );
-            }
-            Err(err) => {
-              // Severe internal error encountered, we should end the compiling here.
-              errored = Some(err);
-              is_expected_shutdown.store(true, Ordering::SeqCst);
-              break;
-            }
-          }
 
-          active_task_count -= 1;
-        }
-        Err(TryRecvError::Disconnected) => {
-          is_expected_shutdown.store(true, Ordering::SeqCst);
-          break;
-        }
-        Err(TryRecvError::Empty) => {
-          if active_task_count == 0 {
+            active_task_count.fetch_sub(1, Ordering::SeqCst);
+          }
+          Err(TryRecvError::Disconnected) => {
             is_expected_shutdown.store(true, Ordering::SeqCst);
+            work_thread.thread().unpark();
+            is_parking.store(false, Ordering::SeqCst);
             break;
+          }
+          Err(TryRecvError::Empty) => {
+            // println!("shit");
+            if active_task_count.load(Ordering::SeqCst) == 0 {
+              if is_parking.load(Ordering::SeqCst) == true {
+                // graceful shutdown
+                // dbg!("fuck");
+                is_expected_shutdown.store(true, Ordering::SeqCst);
+                work_thread.thread().unpark();
+                is_parking.store(false, Ordering::SeqCst);
+                break;
+              } else {
+              }
+            }
           }
         }
       }
@@ -815,7 +860,7 @@ impl Compilation {
   #[allow(clippy::too_many_arguments)]
   fn handle_module_creation(
     &self,
-    queue: &mut FactorizeQueue,
+    queue: &FactorizeQueue,
     original_module_identifier: Option<ModuleIdentifier>,
     original_resource_path: Option<PathBuf>,
     dependencies: Vec<BoxModuleDependency>,
@@ -826,7 +871,7 @@ impl Compilation {
     lazy_visit_modules: std::collections::HashSet<String>,
     issuer: Option<String>,
   ) {
-    queue.add_task(FactorizeTask {
+    queue.push(FactorizeTask {
       original_module_identifier,
       issuer,
       original_resource_path,

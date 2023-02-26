@@ -462,7 +462,13 @@ impl Plugin for AssetPlugin {
         let module = compilation
           .module_graph
           .module_by_identifier(&mgm.module_identifier)
-          .ok_or_else(|| internal_error!("Failed to get module".to_owned()))
+          .ok_or_else(|| {
+            internal_error!(
+              "{} {}",
+              "Failed to get module {}".to_owned(),
+              mgm.module_identifier
+            )
+          })
           // FIXME: use result
           .expect("Failed to get module");
         module.source_types().contains(&SourceType::Asset)

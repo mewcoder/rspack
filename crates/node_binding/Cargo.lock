@@ -2053,6 +2053,7 @@ dependencies = [
  "async-trait",
  "bitflags",
  "crossbeam",
+ "crossbeam-queue",
  "dashmap",
  "derivative",
  "dyn-clone",
